@@ -1779,7 +1779,7 @@ class TheSimpsonsTappedOutLocalServer:
     response.headers['Content-Type'] = 'application/x-protobuf'
     return response
  
-  def extraLandUpdate(self, land_id: str):
+ def extraLandUpdate(self, land_id: str):
     """Handler for prod.simpsons-ea.com/mh/games/bg_gameserver_plugin/extraLandUpdate/<land_id>/protoland/"""
     self.print_headers()
     self.print_args()
@@ -1795,23 +1795,66 @@ class TheSimpsonsTappedOutLocalServer:
     self.log_debug(str(req))
 
     # Apply any currencyDelta entries to the persistent donut balance.
-    # The proto in comments shows:
-    #   repeated CurrencyDelta currencyDelta = 1;
-    #   message CurrencyDelta { optional int32 id = 1; optional string reason = 2; optional int32 amount = 3; optional int64 updatedAt = 4; optional string productId = 5; }
+    # Avoid double-applying the same CurrencyDelta by:
+    # 1) deduplicating identical deltas inside the same request
+    # 2) checking/recording a hash of each delta across requests in the persistent store
     total_delta = 0
+    seen_in_request = set()
     try:
       if hasattr(req, "currencyDelta"):
         for cd in req.currencyDelta:
-          # Most likely field name is 'amount' — fall back gracefully if not present.
+          try:
+            # get a unique key for the currency delta (bytes of proto)
+            cd_bytes = cd.SerializeToString()
+            cd_hash = hashlib.sha1(cd_bytes).hexdigest()
+          except Exception:
+            # fallback: build a simple textual key
+            key_parts = []
+            for field in ["id", "reason", "amount", "updatedAt", "productId"]:
+              if hasattr(cd, field):
+                key_parts.append(str(getattr(cd, field)))
+            cd_hash = hashlib.sha1(("|".join(key_parts)).encode("utf-8")).hexdigest()
+            cd_bytes = None
+
+          # skip duplicates inside the same request
+          if cd_hash in seen_in_request:
+            continue
+          seen_in_request.add(cd_hash)
+
+          # skip if already applied previously (idempotency across requests)
+          try:
+            if has_applied_hash(land_id, cd_hash):
+              self.log_debug(f"Skipping already-applied currencyDelta {cd_hash} for {land_id}")
+              continue
+          except Exception as e:
+            self.log_error(f"Error checking applied hash for {land_id}: {e}")
+            # if the check fails, be conservative and continue (do not skip)
+
+          # extract amount (some proto definitions use 'amount')
           delta_amount = 0
           if hasattr(cd, "amount"):
+            # amount might be int32
             delta_amount = int(cd.amount)
-          elif hasattr(cd, "amount64"):
-            delta_amount = int(cd.amount64)
           else:
-            # no recognized amount field — skip
-            continue
+            # fallback: try to find any numeric field
+            for attr in dir(cd):
+              if attr.lower().startswith("amount"):
+                try:
+                  delta_amount = int(getattr(cd, attr))
+                  break
+                except Exception:
+                  continue
+
+          # apply this delta
           total_delta += delta_amount
+
+          # mark as applied so retries won't double-apply later
+          try:
+            add_applied_hash(land_id, cd_hash)
+          except Exception as e:
+            # log and continue; we still apply the delta in-memory
+            self.log_error(f"Failed to record applied hash for {land_id}: {e}")
+
     except Exception as e:
       self.log_debug(f"currencyDelta processing error: {e}")
 
